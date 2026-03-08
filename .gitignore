@@ -4,3 +4,6 @@ tools/__pycache__/
 __pycache__/
 tmp-dashboard.out
 tmp-dashboard.err
+tmp-*.out
+tmp-*.err
+tests/tmp-transcript-*/

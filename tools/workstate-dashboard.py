@@ -147,12 +147,13 @@ def upsert_session(data):
         if parent_id and parent_id in sessions:
             parent = sessions[parent_id]
             tid = data.get("thread_id", sid)
+            heartbeat = now_iso()
             if tid in parent.threads:
                 t = parent.threads[tid]
                 t.task = data.get("task", t.task)
                 t.status = data.get("status", t.status)
                 t.risk = data.get("risk", t.risk)
-                t.last_seen = now_iso()
+                t.last_seen = heartbeat
             else:
                 parent.threads[tid] = Thread(
                     thread_id=tid,
@@ -160,9 +161,10 @@ def upsert_session(data):
                     task=data.get("task", ""),
                     status=data.get("status", "Running"),
                     risk=data.get("risk", "-"),
-                    started=now_iso(),
-                    last_seen=now_iso(),
+                    started=heartbeat,
+                    last_seen=heartbeat,
                 )
+            parent.last_seen = heartbeat
             # Clean up done threads
             done = [k for k, v in parent.threads.items() if v.status == "Done"]
             for k in done:
@@ -368,109 +370,6 @@ def _project_label(dirname: str) -> str:
     return dirname[-30:]
 
 
-def _extract_last_user_message(jsonl_path: Path) -> str:
-    """Read the last user message from a JSONL transcript (read from end for speed)."""
-    try:
-        # Read last 200KB to find the last user message
-        size = jsonl_path.stat().st_size
-        read_bytes = min(size, 200_000)
-        with open(jsonl_path, "rb") as f:
-            if size > read_bytes:
-                f.seek(size - read_bytes)
-            chunk = f.read().decode("utf-8", errors="replace")
-
-        last_msg = ""
-        for line in chunk.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if d.get("type") != "user":
-                continue
-            msg = d.get("message", {})
-            content = ""
-            if isinstance(msg, dict):
-                c = msg.get("content", "")
-                if isinstance(c, list):
-                    for block in c:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text", "").strip()
-                            # Skip system reminders
-                            if text and not text.startswith("<system-reminder>"):
-                                content = text
-                                break
-                elif isinstance(c, str):
-                    content = c.strip()
-            elif isinstance(msg, str):
-                content = msg.strip()
-            if content:
-                last_msg = content
-        return last_msg[:120] if last_msg else "Session active"
-    except Exception:
-        return "Session active"
-
-
-def _extract_first_user_message(jsonl_path: Path) -> str:
-    """Read the first user message from a JSONL transcript."""
-    try:
-        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if d.get("type") != "user":
-                    continue
-                msg = d.get("message", {})
-                content = ""
-                if isinstance(msg, dict):
-                    c = msg.get("content", "")
-                    if isinstance(c, list):
-                        for block in c:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text = block.get("text", "").strip()
-                                if text and not text.startswith("<system-reminder>"):
-                                    content = text
-                                    break
-                    elif isinstance(c, str):
-                        content = c.strip()
-                elif isinstance(msg, str):
-                    content = msg.strip()
-                if content:
-                    return content[:80]
-        return "Claude Code"
-    except Exception:
-        return "Claude Code"
-
-
-def _extract_slug(jsonl_path: Path) -> str:
-    """Extract the slug field from a subagent JSONL (scan first ~20 lines)."""
-    try:
-        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
-            for i, line in enumerate(f):
-                if i >= 20:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                slug = d.get("slug")
-                if slug:
-                    return slug
-    except Exception:
-        pass
-    return ""
-
-
 # Model pricing per million tokens (USD)
 MODEL_PRICING = {
     "claude-opus-4-6": {"input": 15.0, "output": 75.0, "cache_write": 18.75, "cache_read": 1.50},
@@ -478,26 +377,69 @@ MODEL_PRICING = {
     "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.0, "cache_write": 1.0, "cache_read": 0.08},
 }
 _DEFAULT_PRICING = {"input": 15.0, "output": 75.0, "cache_write": 18.75, "cache_read": 1.50}
+_TRANSCRIPT_SUMMARY_CACHE: dict[str, dict] = {}
 
 
-def _extract_usage(jsonl_path: Path) -> dict:
-    """Sum token usage and estimate cost from a JSONL session file."""
-    totals = {"input_tokens": 0, "output_tokens": 0,
-              "cache_write_tokens": 0, "cache_read_tokens": 0, "cost_usd": 0.0}
+def _empty_usage_totals() -> dict:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+    }
+
+
+def _extract_message_text(message) -> str:
+    if isinstance(message, dict):
+        content = message.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    continue
+                text = block.get("text", "").strip()
+                if text and not text.startswith("<system-reminder>"):
+                    return text
+        elif isinstance(content, str):
+            return content.strip()
+    elif isinstance(message, str):
+        return message.strip()
+    return ""
+
+
+def _build_transcript_summary(jsonl_path: Path) -> dict:
+    """Parse a transcript once and cache the derived fields by file stat."""
+    first_msg = ""
+    last_msg = ""
+    slug = ""
+    totals = _empty_usage_totals()
+
     try:
         with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
+            for index, line in enumerate(f):
                 line = line.strip()
-                if not line or '"usage"' not in line:
+                if not line:
                     continue
                 try:
                     d = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+
+                if not slug and index < 20:
+                    slug = d.get("slug", "") or slug
+
+                if d.get("type") == "user":
+                    content = _extract_message_text(d.get("message", {}))
+                    if content:
+                        if not first_msg:
+                            first_msg = content[:80]
+                        last_msg = content[:120]
+
                 msg = d.get("message", {})
                 usage = msg.get("usage") if isinstance(msg, dict) else None
                 if not usage or not isinstance(usage, dict):
                     continue
+
                 model = msg.get("model", "") if isinstance(msg, dict) else ""
                 pricing = MODEL_PRICING.get(model, _DEFAULT_PRICING)
                 inp = usage.get("input_tokens", 0) or 0
@@ -515,9 +457,61 @@ def _extract_usage(jsonl_path: Path) -> dict:
                     + cr * pricing["cache_read"] / 1_000_000
                 )
     except Exception:
-        pass
+        return {
+            "first_user_message": "Claude Code",
+            "last_user_message": "Session active",
+            "slug": "",
+            "usage": totals,
+        }
+
     totals["cost_usd"] = round(totals["cost_usd"], 4)
-    return totals
+    return {
+        "first_user_message": first_msg or "Claude Code",
+        "last_user_message": last_msg or "Session active",
+        "slug": slug,
+        "usage": totals,
+    }
+
+
+def _get_transcript_summary(jsonl_path: Path) -> dict:
+    cache_key = str(jsonl_path)
+    try:
+        stat = jsonl_path.stat()
+    except Exception:
+        return {
+            "first_user_message": "Claude Code",
+            "last_user_message": "Session active",
+            "slug": "",
+            "usage": _empty_usage_totals(),
+        }
+
+    signature = (stat.st_mtime_ns, stat.st_size)
+    cached = _TRANSCRIPT_SUMMARY_CACHE.get(cache_key)
+    if cached and cached.get("signature") == signature:
+        return cached["summary"]
+
+    summary = _build_transcript_summary(jsonl_path)
+    _TRANSCRIPT_SUMMARY_CACHE[cache_key] = {
+        "signature": signature,
+        "summary": summary,
+    }
+    return summary
+
+
+def _extract_last_user_message(jsonl_path: Path) -> str:
+    return _get_transcript_summary(jsonl_path)["last_user_message"]
+
+
+def _extract_first_user_message(jsonl_path: Path) -> str:
+    return _get_transcript_summary(jsonl_path)["first_user_message"]
+
+
+def _extract_slug(jsonl_path: Path) -> str:
+    return _get_transcript_summary(jsonl_path)["slug"]
+
+
+def _extract_usage(jsonl_path: Path) -> dict:
+    return dict(_get_transcript_summary(jsonl_path)["usage"])
 
 
 def _get_system_stats() -> dict:
@@ -952,8 +946,9 @@ def scan_claude_sessions():
 
                     sid = AUTO_PREFIX + jsonl.stem
                     status = "Running" if age < ACTIVE_THRESHOLD_SEC else "Idle"
-                    last_msg = _extract_last_user_message(jsonl)
-                    first_msg = _extract_first_user_message(jsonl)
+                    summary = _get_transcript_summary(jsonl)
+                    last_msg = summary["last_user_message"]
+                    first_msg = summary["first_user_message"]
 
                     # Use first message as session name, last message as current task
                     name = first_msg if first_msg != "Claude Code" else project_label
@@ -962,7 +957,7 @@ def scan_claude_sessions():
                     # Tab matching is done after all JSONLs are collected
                     tab_label = ""
 
-                    usage = _extract_usage(jsonl)
+                    usage = dict(summary["usage"])
 
                     detected[sid] = {
                         "session_id": sid,
@@ -999,9 +994,10 @@ def scan_claude_sessions():
                             continue
 
                         agent_id = agent_jsonl.stem  # e.g. "agent-a34fbb0c3a222503e"
-                        slug = _extract_slug(agent_jsonl)
+                        summary = _get_transcript_summary(agent_jsonl)
+                        slug = summary["slug"]
                         thread_name = slug if slug else agent_id
-                        task = _extract_last_user_message(agent_jsonl)
+                        task = summary["last_user_message"]
                         status = "Running" if age < ACTIVE_THRESHOLD_SEC else "Idle"
                         mtime_iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -170,12 +171,12 @@ def _load_json_value(key: str, tools_dir: Path, default):
     """Load JSON from env if present, otherwise return a deep copy of default."""
     raw = _load_env_value(key, tools_dir, "")
     if not raw:
-        return json.loads(json.dumps(default))
+        return copy.deepcopy(default)
     try:
         parsed = json.loads(raw)
         return parsed
     except Exception:
-        return json.loads(json.dumps(default))
+        return copy.deepcopy(default)
 
 
 def _load_services(tools_dir: Path) -> dict[str, str]:

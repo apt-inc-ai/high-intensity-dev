@@ -39,7 +39,7 @@ DEFAULT_SERVICE_GROUPS = [
                 "id": "web-frontend",
                 "name": "Web Frontend",
                 "display_url": "app.apt-gus.ai",
-                "probe_url": "https://app.apt-gus.ai/",
+                "probe_url": "https://app.apt-gus.ai/api/health",
                 "link_url": "https://app.apt-gus.ai/",
                 "kind": "http",
             },

@@ -39,6 +39,7 @@ Practical, implementable patterns for specific failure modes:
 ### [Tools](tools/)
 
 - **[Workstate Dashboard](tools/workstate-dashboard.py)** — Local web server that aggregates status from multiple Claude Code sessions. One browser tab shows all your terminal tabs and their subagents. Zero dependencies, stdlib only. `python tools/workstate-dashboard.py` and open `http://localhost:7777`.
+- **[Platform Assumptions](docs/platform-assumptions.md)** — OS/runtime requirements plus optional env vars for Railway and ElevenLabs integrations.
 
 ### [Claude Code Integration](claude-code/)
 

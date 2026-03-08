@@ -1,2 +1,6 @@
 tools/.env
 .watchdog.lock
+tools/__pycache__/
+__pycache__/
+tmp-dashboard.out
+tmp-dashboard.err

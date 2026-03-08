@@ -16,7 +16,6 @@ Dashboard: http://localhost:7777
 import argparse
 import base64
 import json
-import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -24,7 +23,11 @@ from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 import subprocess
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse
+
+from workstate_dashboard_config import load_dashboard_config
 
 # Hide console windows spawned by subprocess on Windows
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
@@ -112,6 +115,20 @@ def relative_time(iso_str):
         return f"{int(age // 60)}m ago"
     else:
         return f"{int(age // 3600)}h ago"
+
+
+def _status_rank(status: str) -> int:
+    ranks = {
+        "Failed": 0,
+        "Blocked": 1,
+        "Awaiting Approval": 2,
+        "Running": 3,
+        "Thinking": 3,
+        "Up": 3,
+        "Idle": 4,
+        "Done": 5,
+    }
+    return ranks.get(status or "", 6)
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +237,7 @@ def get_sessions_json():
                     "staleness": staleness(t.last_seen),
                     "last_seen_relative": relative_time(t.last_seen),
                 })
+            threads.sort(key=lambda t: (_status_rank(t["status"]), seconds_since(t["last_seen"])))
             result.append({
                 "session_id": s.session_id,
                 "name": s.name,
@@ -235,6 +253,7 @@ def get_sessions_json():
                 "history": list(s.history),
                 "threads": threads,
             })
+        result.sort(key=lambda s: (_status_rank(s["status"]), seconds_since(s["last_seen"])))
 
         total_threads = sum(len(s.threads) for s in sessions.values())
         # Aggregate usage across all sessions
@@ -248,6 +267,7 @@ def get_sessions_json():
         sys_stats = _system_stats_cache["data"]
         railway_stats = _railway_cache["data"]
         elevenlabs_stats = _elevenlabs_cache["data"]
+        service_stats = _service_status_cache["data"]
 
         return {
             "sessions": result,
@@ -260,6 +280,8 @@ def get_sessions_json():
             "system": sys_stats,
             "railway": railway_stats,
             "elevenlabs": elevenlabs_stats,
+            "services": service_stats,
+            "dashboard": DASHBOARD_UI_CONFIG,
             "timestamp": now_iso(),
         }
 
@@ -505,7 +527,7 @@ def _get_system_stats() -> dict:
              "disk_pct": 0, "disk_used_gb": 0, "disk_total_gb": 0}
     # Disk via stdlib (always works)
     try:
-        du = shutil.disk_usage("C:\\")
+        du = shutil.disk_usage(Path.home().anchor or "/")
         used = du.total - du.free
         stats["disk_pct"] = round(used / du.total * 100, 1)
         stats["disk_used_gb"] = round(used / (1024**3))
@@ -544,42 +566,43 @@ def _get_system_stats() -> dict:
 # Cache system stats (refreshed by background thread)
 _system_stats_cache = {"data": {}, "ts": 0}
 
-# Railway integration
-def _load_env_token(key: str) -> str:
-    """Load a token from env var or tools/.env file."""
-    val = os.environ.get(key, "")
-    if val:
-        return val
-    env_file = Path(__file__).resolve().parent / ".env"
-    try:
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line.startswith(f"{key}="):
-                return line.split("=", 1)[1].strip()
-    except Exception:
-        pass
-    return ""
-
-RAILWAY_TOKEN = _load_env_token("RAILWAY_TOKEN")
-RAILWAY_PROJECT_ID = "8798273c-5bcf-4be7-8111-959295307ada"
-RAILWAY_ENV_ID = "26f2c503-c4f0-4801-a4e5-5b14c0eac065"
-RAILWAY_SERVICES = {
-    "backend": "c22cb112-642f-4632-83f0-948c2f68d5bc",
-    "frontend": "0174e9bf-b6c5-4990-aa12-3fa42ff4f268",
+_DASHBOARD_CONFIG = load_dashboard_config(Path(__file__).resolve().parent)
+DASHBOARD_UI_CONFIG = {
+    "service_groups": _DASHBOARD_CONFIG.get("service_groups", []),
+    "page_groups": _DASHBOARD_CONFIG.get("page_groups", []),
 }
-RAILWAY_API = "https://backboard.railway.com/graphql/v2"
+
+# Railway integration
+RAILWAY_TOKEN = _DASHBOARD_CONFIG["railway_token"]
+RAILWAY_PROJECT_ID = _DASHBOARD_CONFIG["railway_project_id"]
+RAILWAY_ENV_ID = _DASHBOARD_CONFIG["railway_env_id"]
+RAILWAY_SERVICES = _DASHBOARD_CONFIG["railway_services"]
+RAILWAY_API = _DASHBOARD_CONFIG["railway_api"]
+RAILWAY_ENABLED = all([
+    RAILWAY_TOKEN,
+    RAILWAY_PROJECT_ID,
+    RAILWAY_ENV_ID,
+    RAILWAY_SERVICES.get("backend", ""),
+    RAILWAY_SERVICES.get("frontend", ""),
+])
 _railway_cache = {"data": {}, "ts": 0}
 
 
 def _get_railway_stats() -> dict:
     """Fetch Railway service metrics + estimated usage via GraphQL API."""
-    from urllib.request import Request, urlopen
-    stats = {"backend": {"cpu": 0, "mem_mb": 0}, "frontend": {"cpu": 0, "mem_mb": 0},
-             "estimated": {"cpu_hrs": 0, "mem_gb_hrs": 0, "net_tx_gb": 0}}
-    if not RAILWAY_TOKEN:
+    stats = {
+        "configured": RAILWAY_ENABLED,
+        "backend": {"cpu": 0, "mem_mb": 0},
+        "frontend": {"cpu": 0, "mem_mb": 0},
+        "estimated": {"cpu_hrs": 0, "mem_gb_hrs": 0, "net_tx_gb": 0},
+    }
+    if not RAILWAY_ENABLED:
         return stats
-    headers = {"Content-Type": "application/json", "Project-Access-Token": RAILWAY_TOKEN,
-                "User-Agent": "workstate-dashboard/1.0"}
+    headers = {
+        "Content-Type": "application/json",
+        "Project-Access-Token": RAILWAY_TOKEN,
+        "User-Agent": "workstate-dashboard/1.0",
+    }
     today = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
     try:
         # Build a single query for both services + estimated usage
@@ -599,8 +622,8 @@ def _get_railway_stats() -> dict:
         )
         query = "{ " + " ".join(parts) + " }"
         body = json.dumps({"query": query}).encode()
-        req = Request(RAILWAY_API, data=body, headers=headers, method="POST")
-        with urlopen(req, timeout=10) as resp:
+        req = urllib.request.Request(RAILWAY_API, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
         d = data.get("data", {})
         # Parse service metrics (latest value)
@@ -629,37 +652,21 @@ def _get_railway_stats() -> dict:
 
 
 # ElevenLabs usage tracking
-def _load_elevenlabs_key() -> str:
-    """Load ElevenLabs API key from env or gus-demo-r1 .env file."""
-    key = os.environ.get("ELEVENLABS_API_KEY", "")
-    if key:
-        return key
-    # Fallback: read from sibling project's .env
-    env_path = Path(__file__).resolve().parent.parent.parent / "gus-demo-r1" / "backend" / ".env"
-    try:
-        for line in env_path.read_text().splitlines():
-            if line.startswith("ELEVENLABS_API_KEY="):
-                return line.split("=", 1)[1].strip()
-    except Exception:
-        pass
-    return ""
-
-ELEVENLABS_API_KEY = _load_elevenlabs_key()
+ELEVENLABS_API_KEY = _DASHBOARD_CONFIG["elevenlabs_api_key"]
 _elevenlabs_cache = {"data": {}, "ts": 0}
 
 
 def _get_elevenlabs_usage() -> dict:
     """Fetch ElevenLabs character usage via subscription API."""
-    from urllib.request import Request, urlopen
-    result = {"used": 0, "limit": 0, "pct": 0, "tier": ""}
+    result = {"configured": bool(ELEVENLABS_API_KEY), "used": 0, "limit": 0, "pct": 0, "tier": ""}
     if not ELEVENLABS_API_KEY:
         return result
     try:
-        req = Request(
+        req = urllib.request.Request(
             "https://api.elevenlabs.io/v1/user/subscription",
             headers={"xi-api-key": ELEVENLABS_API_KEY},
         )
-        with urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
         used = data.get("character_count", 0)
         limit = data.get("character_limit", 0)
@@ -670,6 +677,139 @@ def _get_elevenlabs_usage() -> dict:
     except Exception:
         pass
     return result
+
+
+_service_status_cache = {"data": {"items": [], "summary": {}, "updated_at": ""}, "ts": 0}
+
+
+def _service_error_detail(error: Exception) -> str:
+    reason = getattr(error, "reason", None)
+    if reason:
+        return str(reason)
+    if getattr(error, "code", None):
+        return f"HTTP {error.code}"
+    return error.__class__.__name__
+
+
+def _probe_http_service(service: dict, timeout: float = 5.0) -> dict:
+    probe_url = service.get("probe_url") or service.get("link_url") or ""
+    started = time.perf_counter()
+    result = {
+        "id": service.get("id", ""),
+        "name": service.get("name", "Unnamed service"),
+        "display_url": service.get("display_url", ""),
+        "link_url": service.get("link_url", probe_url),
+        "state": "offline",
+        "label": "Offline",
+        "detail": "Not checked",
+        "latency_ms": None,
+        "checked_at": now_iso(),
+    }
+    if not probe_url:
+        result["state"] = "degraded"
+        result["label"] = "Missing URL"
+        result["detail"] = "No probe_url configured"
+        return result
+
+    req = urllib.request.Request(
+        probe_url,
+        headers={"User-Agent": "workstate-dashboard/1.0"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status_code = getattr(resp, "status", None) or resp.getcode()
+            result["latency_ms"] = int((time.perf_counter() - started) * 1000)
+            result["checked_at"] = now_iso()
+            if 200 <= status_code < 400:
+                result["state"] = "online"
+                result["label"] = "Online"
+                result["detail"] = f"HTTP {status_code}"
+            elif status_code < 500:
+                result["state"] = "degraded"
+                result["label"] = f"HTTP {status_code}"
+                result["detail"] = "Probe endpoint responded with a client error"
+            else:
+                result["state"] = "offline"
+                result["label"] = f"HTTP {status_code}"
+                result["detail"] = "Probe endpoint responded with a server error"
+    except urllib.error.HTTPError as exc:
+        result["latency_ms"] = int((time.perf_counter() - started) * 1000)
+        result["checked_at"] = now_iso()
+        result["state"] = "degraded" if exc.code < 500 else "offline"
+        result["label"] = f"HTTP {exc.code}"
+        result["detail"] = _service_error_detail(exc)
+    except Exception as exc:
+        result["latency_ms"] = int((time.perf_counter() - started) * 1000)
+        result["checked_at"] = now_iso()
+        result["detail"] = _service_error_detail(exc)
+    return result
+
+
+def _fetch_statuspage_summary(timeout: float = 10.0) -> dict[str, dict]:
+    req = urllib.request.Request(
+        "https://status.claude.com/api/v2/summary.json",
+        headers={"User-Agent": "workstate-dashboard/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    return {
+        component.get("id", ""): component
+        for component in data.get("components", [])
+        if component.get("id")
+    }
+
+
+def _probe_statuspage_service(service: dict, components: dict[str, dict]) -> dict:
+    component = components.get(service.get("component_id", ""))
+    status = component.get("status", "") if component else ""
+    labels = {
+        "operational": ("online", "Operational"),
+        "degraded_performance": ("degraded", "Degraded"),
+        "partial_outage": ("degraded", "Partial outage"),
+        "major_outage": ("offline", "Outage"),
+        "under_maintenance": ("degraded", "Maintenance"),
+    }
+    state, label = labels.get(status, ("offline", "Unknown"))
+    return {
+        "id": service.get("id", ""),
+        "name": service.get("name", "Unnamed service"),
+        "display_url": service.get("display_url", ""),
+        "link_url": service.get("link_url", ""),
+        "state": state,
+        "label": label,
+        "detail": component.get("description", "") if component else "Statuspage component not found",
+        "latency_ms": None,
+        "checked_at": now_iso(),
+    }
+
+
+def _get_service_statuses() -> dict:
+    items = []
+    claude_components = {}
+    try:
+        claude_components = _fetch_statuspage_summary()
+    except Exception:
+        claude_components = {}
+
+    for group in DASHBOARD_UI_CONFIG.get("service_groups", []):
+        for service in group.get("services", []):
+            kind = service.get("kind", "http")
+            if kind == "statuspage_component":
+                items.append(_probe_statuspage_service(service, claude_components))
+            else:
+                items.append(_probe_http_service(service))
+
+    summary = {"online": 0, "degraded": 0, "offline": 0}
+    for item in items:
+        state = item.get("state", "offline")
+        summary[state] = summary.get(state, 0) + 1
+
+    return {
+        "items": items,
+        "summary": summary,
+        "updated_at": now_iso(),
+    }
 
 
 def _scan_wt_tabs():
@@ -1028,6 +1168,9 @@ def cache_refresher():
             if now - _elevenlabs_cache["ts"] > 60:
                 _elevenlabs_cache["data"] = _get_elevenlabs_usage()
                 _elevenlabs_cache["ts"] = now
+            if now - _service_status_cache["ts"] > 15:
+                _service_status_cache["data"] = _get_service_statuses()
+                _service_status_cache["ts"] = now
         except Exception:
             pass  # never let the cache refresher die
         time.sleep(10)
@@ -1122,790 +1265,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
 # Dashboard HTML
 # ---------------------------------------------------------------------------
 
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Workstate Dashboard</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%23000'/><text x='16' y='22' text-anchor='middle' font-family='monospace' font-weight='bold' font-size='18' fill='%23e34' letter-spacing='-1'>W</text><rect x='2' y='26' width='28' height='3' rx='1' fill='%23e34'/></svg>">
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    background: #000000;
-    color: #c9d1d9;
-    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
-    font-size: 14px;
-    padding: 24px;
-    min-height: 100vh;
-  }
-  .header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 24px;
-    padding-bottom: 16px;
-    border-bottom: 1px solid #21262d;
-    position: relative;
-  }
-  .header-center {
-    position: absolute;
-    left: 50%;
-    transform: translateX(-50%);
-    text-align: center;
-  }
-  .header h1 {
-    font-size: 18px;
-    font-weight: 600;
-    color: #e6edf3;
-    letter-spacing: 0.5px;
-  }
-  .header .meta {
-    font-size: 12px;
-    color: #7d8590;
-    margin-top: 2px;
-  }
-  .header-left {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-  }
-  .header-logo {
-    height: 72px;
-    border-radius: 6px;
-  }
-  .header-logo-right {
-    height: 72px;
-    border-radius: 6px;
-  }
-  .counts {
-    display: flex;
-    gap: 16px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-    align-items: center;
-  }
-  .count-badge {
-    background: #161b22;
-    border: 1px solid #21262d;
-    border-radius: 6px;
-    padding: 8px 16px;
-    font-size: 13px;
-  }
-  .count-badge .num {
-    font-size: 20px;
-    font-weight: 700;
-    color: #e6edf3;
-  }
-  .count-badge .label {
-    color: #7d8590;
-    margin-left: 6px;
-  }
-  .counts-divider {
-    width: 1px;
-    height: 32px;
-    background: #21262d;
-  }
-  .count-badge.usage .num { color: #d2a8ff; font-size: 16px; }
-  .count-badge.usage .label { font-size: 11px; }
-  .count-badge.system .num { font-size: 16px; }
-  .count-badge.system .label { font-size: 11px; }
-  .count-badge.system .num.ok { color: #3fb950; }
-  .count-badge.system .num.warn { color: #d29922; }
-  .count-badge.system .num.crit { color: #f85149; }
-  .count-badge.railway .num { color: #58a6ff; font-size: 16px; }
-  .count-badge.railway .label { font-size: 11px; }
-  .count-badge.elevenlabs .num { font-size: 16px; }
-  .count-badge.elevenlabs .label { font-size: 11px; }
-  .count-badge.elevenlabs .num.ok { color: #3fb950; }
-  .count-badge.elevenlabs .num.warn { color: #d29922; }
-  .count-badge.elevenlabs .num.crit { color: #f85149; }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    margin-bottom: 24px;
-  }
-  th {
-    text-align: left;
-    padding: 10px 12px;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: #7d8590;
-    border-bottom: 1px solid #21262d;
-  }
-  td {
-    padding: 10px 12px;
-    border-bottom: 1px solid #161b22;
-    vertical-align: top;
-  }
-  tr.session:hover { background: #161b22; }
-  tr.thread { background: #0d1117; }
-  tr.thread td { padding-left: 36px; font-size: 13px; color: #8b949e; }
-  tr.thread:hover { background: #13181f; }
-  .name-cell {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }
-  .dot-ok { background: #3fb950; box-shadow: 0 0 6px #3fb95066; }
-  .dot-warning { background: #d29922; box-shadow: 0 0 6px #d2992266; }
-  .dot-idle { background: #484f58; box-shadow: 0 0 4px #484f5844; }
-  .status {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 12px;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.3px;
-  }
-  .status-running { background: #23853320; color: #3fb950; border: 1px solid #23853350; }
-  .status-thinking { background: #8b5cf620; color: #a78bfa; border: 1px solid #8b5cf650; }
-  .status-idle { background: #21262d; color: #7d8590; border: 1px solid #30363d; }
-  .status-awaiting-approval { background: #d2992220; color: #d29922; border: 1px solid #d2992250; }
-  .status-up { background: #1f6feb20; color: #58a6ff; border: 1px solid #1f6feb50; }
-  .status-blocked { background: #9e6a0320; color: #d29922; border: 1px solid #9e6a0350; }
-  .status-failed { background: #da363420; color: #f85149; border: 1px solid #da363450; }
-  .status-done { background: #21262d; color: #7d8590; border: 1px solid #30363d; }
-  .risk-text { color: #d29922; font-size: 12px; }
-  .risk-none { color: #484f58; }
-  .last-seen { color: #7d8590; font-size: 12px; }
-  .tab-text {
-    max-width: 200px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 12px;
-    color: #7d8590;
-  }
-  .task-text {
-    max-width: 400px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .session-name {
-    font-weight: 600;
-    color: #e6edf3;
-  }
-  .thread-name {
-    color: #8b949e;
-    font-style: italic;
-  }
-  .empty-state {
-    text-align: center;
-    padding: 60px 20px;
-    color: #484f58;
-  }
-  .empty-state h2 {
-    font-size: 16px;
-    margin-bottom: 8px;
-    color: #7d8590;
-  }
-  .empty-state p { font-size: 13px; }
-  .expired-section {
-    border-top: 1px solid #21262d;
-    padding-top: 16px;
-    margin-top: 8px;
-  }
-  .expired-section h3 {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: #484f58;
-    margin-bottom: 8px;
-  }
-  .expired-item {
-    font-size: 12px;
-    color: #484f58;
-    padding: 2px 0;
-  }
-  .tooltip {
-    position: relative;
-    cursor: default;
-  }
-  .tooltip .tooltip-text {
-    visibility: hidden;
-    background: #1c2128;
-    border: 1px solid #30363d;
-    border-radius: 6px;
-    padding: 8px 12px;
-    position: absolute;
-    z-index: 10;
-    top: 100%;
-    left: 0;
-    margin-top: 4px;
-    font-size: 12px;
-    white-space: pre-line;
-    min-width: 250px;
-    max-width: 400px;
-    color: #8b949e;
-    box-shadow: 0 4px 12px #00000040;
-  }
-  .tooltip:hover .tooltip-text { visibility: visible; }
-  .warn-banner {
-    background: #9e6a0315;
-    border: 1px solid #9e6a0340;
-    border-radius: 6px;
-    padding: 12px 16px;
-    margin-bottom: 20px;
-    color: #d29922;
-    font-size: 13px;
-    display: none;
-  }
-  .warn-banner.visible { display: block; }
-  /* Service status indicators */
-  .services-row {
-    display: flex;
-    gap: 16px;
-    margin-bottom: 20px;
-  }
-  .service-card {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    background: #161b22;
-    border: 1px solid #21262d;
-    border-radius: 6px;
-    padding: 10px 16px;
-    min-width: 200px;
-  }
-  .service-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }
-  .service-dot-online { background: #3fb950; box-shadow: 0 0 8px #3fb95066; }
-  .service-dot-offline { background: #f85149; box-shadow: 0 0 8px #f8514966; animation: pulse-dot 1.5s ease-in-out infinite; }
-  .service-dot-checking { background: #d29922; box-shadow: 0 0 6px #d2992266; animation: pulse-dot 1s ease-in-out infinite; }
-  .service-dot-degraded { background: #d29922; box-shadow: 0 0 8px #d2992266; }
-  @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-  .service-info { display: flex; flex-direction: column; }
-  .service-name { font-size: 13px; font-weight: 600; color: #e6edf3; }
-  .service-url { font-size: 11px; color: #484f58; }
-  .service-status { margin-left: auto; text-align: right; }
-  .service-label { font-size: 11px; font-weight: 600; }
-  .service-label-online { color: #3fb950; }
-  .service-label-offline { color: #f85149; }
-  .service-label-checking { color: #d29922; }
-  .service-label-degraded { color: #d29922; }
-  .service-latency { font-size: 10px; color: #484f58; }
+def _load_dashboard_html_template() -> str:
+    """Load the dashboard HTML template from a sidecar file."""
+    template_path = Path(__file__).with_name("workstate-dashboard.template.html")
+    try:
+        return template_path.read_text(encoding="utf-8")
+    except Exception as e:
+        raise RuntimeError(f"Could not load dashboard template at {template_path}: {e}")
 
-  /* Local pages grid */
-  .pages-section {
-    margin-bottom: 24px;
-  }
-  .pages-section h3 {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: #7d8590;
-    margin-bottom: 10px;
-    font-weight: 600;
-  }
-  .pages-grid {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-  }
-  .page-link {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    background: #161b22;
-    border: 1px solid #21262d;
-    border-radius: 6px;
-    padding: 8px 14px;
-    text-decoration: none;
-    color: #8b949e;
-    font-size: 13px;
-    transition: all 0.15s;
-  }
-  .page-link:hover {
-    background: #1c2128;
-    border-color: #30363d;
-    color: #e6edf3;
-  }
-  .page-link svg {
-    flex-shrink: 0;
-    opacity: 0.5;
-  }
-  .page-link:hover svg { opacity: 0.9; }
-  .page-link .route {
-    font-size: 10px;
-    color: #484f58;
-    margin-left: 4px;
-  }
 
-  .watermark {
-    position: fixed;
-    bottom: 24px;
-    pointer-events: none;
-    z-index: 999;
-  }
-  .watermark-left { left: 24px; }
-  .watermark img {
-    width: 600px;
-    height: auto;
-    border-radius: 16px;
-  }
-</style>
-</head>
-<body>
-  <div class="header">
-    <div class="header-left">
-      <img class="header-logo" src="{{LOGO_DATA_URI}}" alt="Logo" style="display:{{LOGO_DISPLAY}}">
-    </div>
-    <div class="header-center">
-      <h1>WORKSTATE DASHBOARD</h1>
-      <div class="meta">auto-refresh: 5s</div>
-    </div>
-    <img class="header-logo-right" src="{{GUS_LOGO_URI}}" alt="GUS.ai" style="display:{{GUS_LOGO_DISPLAY}}">
-  </div>
-  <div id="warn-banner" class="warn-banner"></div>
-  <div class="counts" id="counts"></div>
-
-  <!-- Service status -->
-  <div class="services-row" id="services">
-    <div class="service-card" id="svc-frontend">
-      <div class="service-dot service-dot-checking" id="svc-fe-dot"></div>
-      <div class="service-info">
-        <span class="service-name">Frontend</span>
-        <span class="service-url">localhost:3000</span>
-      </div>
-      <div class="service-status">
-        <div class="service-label service-label-checking" id="svc-fe-label">Checking...</div>
-        <div class="service-latency" id="svc-fe-latency"></div>
-      </div>
-    </div>
-    <div class="service-card" id="svc-backend">
-      <div class="service-dot service-dot-checking" id="svc-be-dot"></div>
-      <div class="service-info">
-        <span class="service-name">Backend API</span>
-        <span class="service-url">localhost:8001</span>
-      </div>
-      <div class="service-status">
-        <div class="service-label service-label-checking" id="svc-be-label">Checking...</div>
-        <div class="service-latency" id="svc-be-latency"></div>
-      </div>
-    </div>
-    <div style="width:1px;background:#21262d;margin:4px 0"></div>
-    <div class="service-card" id="svc-web-fe">
-      <div class="service-dot service-dot-checking" id="svc-wfe-dot"></div>
-      <div class="service-info">
-        <span class="service-name">Web Frontend</span>
-        <span class="service-url">app.apt-gus.ai</span>
-      </div>
-      <div class="service-status">
-        <div class="service-label service-label-checking" id="svc-wfe-label">Checking...</div>
-        <div class="service-latency" id="svc-wfe-latency"></div>
-      </div>
-    </div>
-    <div class="service-card" id="svc-web-be">
-      <div class="service-dot service-dot-checking" id="svc-wbe-dot"></div>
-      <div class="service-info">
-        <span class="service-name">Web Backend</span>
-        <span class="service-url">api.apt-gus.ai</span>
-      </div>
-      <div class="service-status">
-        <div class="service-label service-label-checking" id="svc-wbe-label">Checking...</div>
-        <div class="service-latency" id="svc-wbe-latency"></div>
-      </div>
-    </div>
-    <div style="width:1px;background:#21262d;margin:4px 0"></div>
-    <div class="service-card" id="svc-claude-api">
-      <div class="service-dot service-dot-checking" id="svc-capi-dot"></div>
-      <div class="service-info">
-        <span class="service-name">Claude API</span>
-        <span class="service-url">api.anthropic.com</span>
-      </div>
-      <div class="service-status">
-        <div class="service-label service-label-checking" id="svc-capi-label">Checking...</div>
-      </div>
-    </div>
-    <div class="service-card" id="svc-claude-code">
-      <div class="service-dot service-dot-checking" id="svc-ccode-dot"></div>
-      <div class="service-info">
-        <span class="service-name">Claude Code</span>
-        <span class="service-url">status.claude.com</span>
-      </div>
-      <div class="service-status">
-        <div class="service-label service-label-checking" id="svc-ccode-label">Checking...</div>
-      </div>
-    </div>
-    <div class="service-card" id="svc-claude-ai">
-      <div class="service-dot service-dot-checking" id="svc-cai-dot"></div>
-      <div class="service-info">
-        <span class="service-name">claude.ai</span>
-        <span class="service-url">claude.ai</span>
-      </div>
-      <div class="service-status">
-        <div class="service-label service-label-checking" id="svc-cai-label">Checking...</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Local pages -->
-  <div class="pages-section">
-    <h3>Local Pages</h3>
-    <div class="pages-grid">
-      <a class="page-link" href="http://localhost:3000/" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
-        Chat <span class="route">/</span>
-      </a>
-      <a class="page-link" href="http://localhost:3000/digital-twin" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-        Digital Twin <span class="route">/digital-twin</span>
-      </a>
-      <a class="page-link" href="http://localhost:3000/code-graph" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-        Code Graph <span class="route">/code-graph</span>
-      </a>
-      <a class="page-link" href="http://localhost:3000/knowledge-graph" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
-        Knowledge Graph <span class="route">/knowledge-graph</span>
-      </a>
-      <a class="page-link" href="http://localhost:3000/docs-graph" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-        Docs Graph <span class="route">/docs-graph</span>
-      </a>
-      <a class="page-link" href="http://localhost:3000/chart" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        Trend Chart <span class="route">/chart</span>
-      </a>
-      <a class="page-link" href="http://localhost:3000/feedback" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-        Report Issue <span class="route">/feedback</span>
-      </a>
-      <a class="page-link" href="#" onclick="fetch('/api/launch-pwsh').then(()=>this.style.color='#3fb950');return false;">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-        PowerShell 7 <span class="route">pwsh</span>
-      </a>
-    </div>
-  </div>
-
-  <div class="pages-section">
-    <h3>Web Pages</h3>
-    <div class="pages-grid">
-      <a class="page-link" href="https://app.apt-gus.ai/" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
-        Chat <span class="route">app.apt-gus.ai</span>
-      </a>
-      <a class="page-link" href="https://app.apt-gus.ai/digital-twin" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-        Digital Twin <span class="route">/digital-twin</span>
-      </a>
-      <a class="page-link" href="https://app.apt-gus.ai/code-graph" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-        Code Graph <span class="route">/code-graph</span>
-      </a>
-      <a class="page-link" href="https://app.apt-gus.ai/knowledge-graph" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
-        Knowledge Graph <span class="route">/knowledge-graph</span>
-      </a>
-      <a class="page-link" href="https://app.apt-gus.ai/docs-graph" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-        Docs Graph <span class="route">/docs-graph</span>
-      </a>
-      <a class="page-link" href="https://app.apt-gus.ai/chart" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        Trend Chart <span class="route">/chart</span>
-      </a>
-      <a class="page-link" href="https://app.apt-gus.ai/feedback" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-        Report Issue <span class="route">/feedback</span>
-      </a>
-      <a class="page-link" href="https://gus-docs.pages.dev/" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>
-        Docs <span class="route">gus-docs.pages.dev</span>
-      </a>
-      <a class="page-link" href="https://apt-gus.ai/" target="_blank">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
-        Landing Page <span class="route">apt-gus.ai</span>
-      </a>
-    </div>
-  </div>
-
-  <div id="content"></div>
-  <div id="expired-section"></div>
-  <div class="watermark watermark-left" style="display:{{LOGO_LEFT_DISPLAY}}">
-    <img src="{{LOGO_LEFT_URI}}" alt="">
-  </div>
-
-<script>
-const REFRESH_MS = 5000;
-
-function relativeSafe(s) { return s || '?'; }
-
-function statusClass(status) {
-  const s = (status || '').toLowerCase().replace(/\\s+/g, '-');
-  if (s === 'running') return 'status-running';
-  if (s === 'thinking') return 'status-thinking';
-  if (s === 'idle') return 'status-idle';
-  if (s === 'awaiting-approval') return 'status-awaiting-approval';
-  if (s === 'up') return 'status-up';
-  if (s === 'blocked') return 'status-blocked';
-  if (s === 'failed') return 'status-failed';
-  return 'status-done';
-}
-
-function dotClass(staleness) {
-  if (staleness === 'ok') return 'dot-ok';
-  if (staleness === 'warning') return 'dot-warning';
-  if (staleness === 'idle') return 'dot-idle';
-  return 'dot-idle';
-}
-
-function escapeHtml(text) {
-  const d = document.createElement('div');
-  d.textContent = text || '';
-  return d.innerHTML;
-}
-
-function truncate(text, max) {
-  if (!text) return '';
-  return text.length > max ? text.slice(0, max) + '...' : text;
-}
-
-function fmtTokens(n) {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
-  return String(n);
-}
-function pctClass(v) { return v >= 90 ? 'crit' : v >= 70 ? 'warn' : 'ok'; }
-
-function renderTable(data) {
-  const { sessions, expired, counts, usage, system, railway, elevenlabs } = data;
-
-  // Counts + Usage + System + Railway
-  const countsEl = document.getElementById('counts');
-  const totalThreads = sessions.reduce((sum, s) => sum + (s.threads || []).length, 0);
-  const u = usage || {};
-  const totalTokens = (u.input_tokens||0) + (u.output_tokens||0) + (u.cache_write_tokens||0) + (u.cache_read_tokens||0);
-  const sys = system || {};
-  const rw = railway || {};
-  const rwBe = rw.backend || {};
-  const rwFe = rw.frontend || {};
-  const rwEst = rw.estimated || {};
-  countsEl.innerHTML = `
-    <div class="count-badge"><span class="num">${counts.sessions}</span><span class="label">sessions</span></div>
-    <div class="count-badge"><span class="num">${totalThreads}</span><span class="label">threads</span></div>
-    <div class="counts-divider"></div>
-    <div class="count-badge usage"><span class="num">${fmtTokens(totalTokens)}</span><span class="label">tokens</span></div>
-    <div class="count-badge usage"><span class="num">$${(u.cost_usd||0).toFixed(2)}</span><span class="label">cost</span></div>
-    <div class="counts-divider"></div>
-    <div class="count-badge system"><span class="num ${pctClass(sys.cpu_pct||0)}">${sys.cpu_pct||0}%</span><span class="label">CPU</span></div>
-    <div class="count-badge system"><span class="num ${pctClass(sys.mem_pct||0)}">${sys.mem_pct||0}%</span><span class="label">RAM ${sys.mem_used_gb||0}/${sys.mem_total_gb||0} GB</span></div>
-    <div class="count-badge system"><span class="num ${pctClass(sys.disk_pct||0)}">${sys.disk_pct||0}%</span><span class="label">Disk ${sys.disk_used_gb||0}/${sys.disk_total_gb||0} GB</span></div>
-    <div class="counts-divider"></div>
-    <div class="count-badge railway"><span class="num">${rwBe.cpu||0}%</span><span class="label">RW BE CPU</span></div>
-    <div class="count-badge railway"><span class="num">${rwBe.mem_mb||0}</span><span class="label">MB BE RAM</span></div>
-    <div class="count-badge railway"><span class="num">${rwFe.cpu||0}%</span><span class="label">RW FE CPU</span></div>
-    <div class="count-badge railway"><span class="num">${rwFe.mem_mb||0}</span><span class="label">MB FE RAM</span></div>
-    <div class="count-badge railway"><span class="num">${rwEst.net_tx_gb||0}</span><span class="label">GB egress</span></div>
-    ${(() => { const el = elevenlabs || {}; if (!el.limit) return ''; const fmtK = v => v >= 1000000 ? (v/1000000).toFixed(1)+'M' : v >= 1000 ? (v/1000).toFixed(1)+'K' : v; return `<div class="counts-divider"></div><div class="count-badge elevenlabs"><span class="num ${pctClass(el.pct||0)}">${fmtK(el.used)} / ${fmtK(el.limit)}</span><span class="label">chars (${el.pct||0}%) ElevenLabs</span></div>`; })()}
-  `;
-
-  // Warning banner
-  const banner = document.getElementById('warn-banner');
-  const activeCount = counts.sessions;
-  if (activeCount >= 3) {
-    banner.textContent = 'Advisory: ' + activeCount + ' active sessions. Consider whether all threads need your attention right now.';
-    banner.classList.add('visible');
-  } else {
-    banner.classList.remove('visible');
-  }
-
-  // Content
-  const content = document.getElementById('content');
-  if (sessions.length === 0) {
-    content.innerHTML = `
-      <div class="empty-state">
-        <h2>No active sessions</h2>
-        <p>Claude Code sessions will appear here when they report in.</p>
-      </div>`;
-  } else {
-    let html = `<table>
-      <thead><tr>
-        <th style="width:30px">#</th>
-        <th>Session</th>
-        <th>Tab</th>
-        <th>Task</th>
-        <th>Status</th>
-        <th>Risk</th>
-        <th>Last seen</th>
-      </tr></thead><tbody>`;
-
-    sessions.forEach((s, i) => {
-      const historyTip = s.history && s.history.length > 0
-        ? s.history.map(h => escapeHtml(h)).join('\\n')
-        : 'No history';
-      html += `<tr class="session">
-        <td>${i + 1}</td>
-        <td>
-          <div class="name-cell tooltip">
-            <span class="dot ${dotClass(s.staleness)}"></span>
-            <span class="session-name">${escapeHtml(s.name)}</span>
-            <span class="tooltip-text">${historyTip}</span>
-          </div>
-        </td>
-        <td class="tab-text">${escapeHtml(s.tab || '')}</td>
-        <td><div class="task-text">${escapeHtml(s.task)}</div></td>
-        <td><span class="status ${statusClass(s.status)}">${escapeHtml(s.status)}</span></td>
-        <td class="${s.risk === '-' ? 'risk-none' : 'risk-text'}">${escapeHtml(s.risk)}</td>
-        <td class="last-seen">${relativeSafe(s.last_seen_relative)}</td>
-      </tr>`;
-
-      (s.threads || []).forEach((t, ti) => {
-        html += `<tr class="thread">
-          <td style="color:#484f58">${i + 1}.${ti + 1}</td>
-          <td>
-            <div class="name-cell">
-              <span class="dot ${dotClass(t.staleness)}"></span>
-              <span class="thread-name">${escapeHtml(t.name)}</span>
-            </div>
-          </td>
-          <td></td>
-          <td><div class="task-text">${escapeHtml(t.task)}</div></td>
-          <td><span class="status ${statusClass(t.status)}">${escapeHtml(t.status)}</span></td>
-          <td class="${t.risk === '-' ? 'risk-none' : 'risk-text'}">${escapeHtml(t.risk)}</td>
-          <td class="last-seen">${relativeSafe(t.last_seen_relative)}</td>
-        </tr>`;
-      });
-    });
-
-    html += '</tbody></table>';
-    content.innerHTML = html;
-  }
-
-  // Expired section
-  const expiredEl = document.getElementById('expired-section');
-  if (expired && expired.length > 0) {
-    let ehtml = '<div class="expired-section"><h3>Recently Expired</h3>';
-    expired.slice().reverse().forEach(e => {
-      ehtml += `<div class="expired-item">"${escapeHtml(e.name)}" - last task: ${escapeHtml(e.last_task)}</div>`;
-    });
-    ehtml += '</div>';
-    expiredEl.innerHTML = ehtml;
-  } else {
-    expiredEl.innerHTML = '';
-  }
-}
-
-async function refresh() {
-  try {
-    const resp = await fetch('/api/sessions');
-    const data = await resp.json();
-    renderTable(data);
-  } catch (err) {
-    // Server might be restarting, ignore
-  }
-}
-
-refresh();
-setInterval(refresh, REFRESH_MS);
-
-// Service health checks
-function updateService(prefix, online, latencyMs) {
-  const dot = document.getElementById('svc-' + prefix + '-dot');
-  const label = document.getElementById('svc-' + prefix + '-label');
-  const lat = document.getElementById('svc-' + prefix + '-latency');
-  if (online === null) {
-    dot.className = 'service-dot service-dot-checking';
-    label.className = 'service-label service-label-checking';
-    label.textContent = 'Checking...';
-    lat.textContent = '';
-  } else if (online) {
-    dot.className = 'service-dot service-dot-online';
-    label.className = 'service-label service-label-online';
-    label.textContent = 'Online';
-    lat.textContent = latencyMs !== null ? latencyMs + 'ms' : '';
-  } else {
-    dot.className = 'service-dot service-dot-offline';
-    label.className = 'service-label service-label-offline';
-    label.textContent = 'Offline';
-    lat.textContent = '';
-  }
-}
-
-async function checkServices() {
-  // Backend
-  try {
-    const t0 = performance.now();
-    const r = await fetch('http://localhost:8001/health', { signal: AbortSignal.timeout(5000) });
-    updateService('be', r.ok, Math.round(performance.now() - t0));
-  } catch { updateService('be', false, null); }
-  // Frontend
-  try {
-    const t0 = performance.now();
-    const r = await fetch('http://localhost:3000/', { mode: 'no-cors', signal: AbortSignal.timeout(5000) });
-    updateService('fe', true, Math.round(performance.now() - t0));
-  } catch { updateService('fe', false, null); }
-}
-
-checkServices();
-setInterval(checkServices, 8000);
-
-// Web (cloud) service checks
-async function checkWebServices() {
-  // Web backend — api.apt-gus.ai/health (no-cors: CORS blocks cross-origin from localhost)
-  try {
-    const t0 = performance.now();
-    const r = await fetch('https://api.apt-gus.ai/health', { mode: 'no-cors', signal: AbortSignal.timeout(8000) });
-    updateService('wbe', true, Math.round(performance.now() - t0));
-  } catch { updateService('wbe', false, null); }
-  // Web frontend — app.apt-gus.ai
-  try {
-    const t0 = performance.now();
-    const r = await fetch('https://app.apt-gus.ai/', { mode: 'no-cors', signal: AbortSignal.timeout(8000) });
-    updateService('wfe', true, Math.round(performance.now() - t0));
-  } catch { updateService('wfe', false, null); }
-}
-
-checkWebServices();
-setInterval(checkWebServices, 15000);
-
-// Claude status (status.claude.com Statuspage API)
-const CLAUDE_COMPONENTS = {
-  'k8w3r06qmzrp': 'capi',   // Claude API
-  'yyzkbfz2thpt': 'ccode',  // Claude Code
-  'rwppv331jlwc': 'cai',    // claude.ai
-};
-function updateClaudeStatus(key, status) {
-  const dot = document.getElementById('svc-' + key + '-dot');
-  const label = document.getElementById('svc-' + key + '-label');
-  if (!dot || !label) return;
-  const isOp = status === 'operational';
-  const isDeg = status === 'degraded_performance' || status === 'partial_outage';
-  dot.className = 'service-dot ' + (isOp ? 'service-dot-online' : isDeg ? 'service-dot-degraded' : 'service-dot-offline');
-  label.className = 'service-label ' + (isOp ? 'service-label-online' : isDeg ? 'service-label-degraded' : 'service-label-offline');
-  label.textContent = isOp ? 'Operational' : isDeg ? 'Degraded' : status === 'major_outage' ? 'Outage' : status.replace(/_/g, ' ');
-}
-async function checkClaudeStatus() {
-  try {
-    const r = await fetch('https://status.claude.com/api/v2/summary.json', { signal: AbortSignal.timeout(10000) });
-    const d = await r.json();
-    for (const c of (d.components || [])) {
-      const key = CLAUDE_COMPONENTS[c.id];
-      if (key) updateClaudeStatus(key, c.status);
-    }
-  } catch { /* silent */ }
-}
-checkClaudeStatus();
-setInterval(checkClaudeStatus, 60000);
-</script>
-</body>
-</html>
-"""
+DASHBOARD_HTML = _load_dashboard_html_template()
 
 
 # ---------------------------------------------------------------------------
@@ -2002,3 +1371,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -16,6 +16,7 @@ Dashboard: http://localhost:7777
 import argparse
 import base64
 import json
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -81,6 +82,41 @@ WARN_SECONDS = 60
 STALE_SECONDS = 180
 EXPIRE_SECONDS = 600
 PURGE_SECONDS = 300
+
+# ---------------------------------------------------------------------------
+# Persistent session name overrides
+# ---------------------------------------------------------------------------
+
+SESSION_NAMES_FILE = Path(__file__).with_name("session-names.json")
+
+
+def _load_session_names() -> dict:
+    """Load user-assigned session names from disk."""
+    try:
+        return json.loads(SESSION_NAMES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_session_names(mapping: dict):
+    """Atomically write session names to disk."""
+    data = json.dumps(mapping, indent=2)
+    fd, tmp = tempfile.mkstemp(
+        dir=str(SESSION_NAMES_FILE.parent), suffix=".tmp"
+    )
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        Path(tmp).replace(SESSION_NAMES_FILE)
+    except Exception:
+        try:
+            Path(tmp).unlink()
+        except Exception:
+            pass
+        raise
+
+
+session_name_overrides: dict = _load_session_names()
 
 
 def now_iso():
@@ -207,6 +243,23 @@ def upsert_session(data):
         return {"ok": True, "session_id": sid,
                 "name": sessions[sid].name if sid in sessions else data.get("name", ""),
                 "active_sessions": len(sessions)}, 200
+
+
+def rename_session(sid, new_name):
+    """Rename a session and persist the override to disk."""
+    global session_name_overrides
+    new_name = (new_name or "").strip()
+    if not new_name:
+        return {"error": "Name cannot be empty"}, 400
+
+    # Strip auto~ prefix to get the raw UUID for the persistent key
+    raw_id = sid[len(AUTO_PREFIX):] if sid.startswith(AUTO_PREFIX) else sid
+    with lock:
+        session_name_overrides[raw_id] = new_name
+        if sid in sessions:
+            sessions[sid].name = new_name
+    _save_session_names(session_name_overrides)
+    return {"ok": True, "session_id": sid, "name": new_name}, 200
 
 
 def delete_session(sid):
@@ -971,6 +1024,9 @@ def scan_claude_sessions():
                     # Use first message as session name, last message as current task
                     name = first_msg if first_msg != "Claude Code" else project_label
                     name = f"[{project_label}] {name}"
+                    # Apply persistent name override if user renamed this session
+                    if jsonl.stem in session_name_overrides:
+                        name = session_name_overrides[jsonl.stem]
 
                     # Tab matching is done after all JSONLs are collected
                     tab_label = ""
@@ -1239,6 +1295,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self._json_response({"error": "Not found"}, 404)
 
+    def do_PATCH(self):
+        path = urlparse(self.path).path
+        if path.endswith("/name") and path.startswith("/api/session/"):
+            sid = path[len("/api/session/"):-len("/name")]
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length)) if length else {}
+            except (json.JSONDecodeError, ValueError):
+                self._json_response({"error": "Invalid JSON"}, 400)
+                return
+            result, code = rename_session(sid, body.get("name", ""))
+            self._json_response(result, code)
+        else:
+            self._json_response({"error": "Not found"}, 404)
+
     def do_DELETE(self):
         path = urlparse(self.path).path
         if path.startswith("/api/session/"):
@@ -1263,7 +1334,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "http://localhost:7777")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def _serve_html(self):

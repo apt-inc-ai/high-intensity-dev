@@ -41,6 +41,10 @@ class WorkstateDashboardTests(unittest.TestCase):
         self.original_system_boot_time = self.globals["SYSTEM_BOOT_TIME"]
         self.original_active_threshold = self.globals["ACTIVE_THRESHOLD_SEC"]
         self.original_idle_threshold = self.globals["IDLE_THRESHOLD_SEC"]
+        self.original_session_names_file = self.globals["SESSION_NAMES_FILE"]
+        self.original_session_name_overrides = copy.deepcopy(
+            self.globals["session_name_overrides"]
+        )
 
     def tearDown(self):
         self.globals["WARN_SECONDS"] = self.original_warn_seconds
@@ -63,6 +67,11 @@ class WorkstateDashboardTests(unittest.TestCase):
         self.globals["SYSTEM_BOOT_TIME"] = self.original_system_boot_time
         self.globals["ACTIVE_THRESHOLD_SEC"] = self.original_active_threshold
         self.globals["IDLE_THRESHOLD_SEC"] = self.original_idle_threshold
+        self.globals["SESSION_NAMES_FILE"] = self.original_session_names_file
+        self.globals["session_name_overrides"].clear()
+        self.globals["session_name_overrides"].update(
+            copy.deepcopy(self.original_session_name_overrides)
+        )
 
     def test_staleness_thresholds(self):
         now_iso = self.mod["now_iso"]()
@@ -288,6 +297,98 @@ class WorkstateDashboardTests(unittest.TestCase):
 
             self.assertGreater(calls["count"], count_after_first)
             self.assertEqual(updated["last_user_message"], "newest task")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+    def test_rename_session_persists_to_disk(self):
+        tmpdir = Path(__file__).resolve().parent / f"tmp-names-{uuid.uuid4().hex}"
+        tmpdir.mkdir()
+        names_file = tmpdir / "session-names.json"
+        self.globals["SESSION_NAMES_FILE"] = names_file
+
+        try:
+            upsert = self.mod["upsert_session"]
+            upsert({"session_id": "s1", "name": "original", "task": "t1"})
+
+            result, code = self.mod["rename_session"]("s1", "My Custom Name")
+            self.assertEqual(code, 200)
+            self.assertEqual(result["name"], "My Custom Name")
+            self.assertEqual(self.globals["sessions"]["s1"].name, "My Custom Name")
+
+            # Verify written to disk
+            self.assertTrue(names_file.exists())
+            on_disk = json.loads(names_file.read_text(encoding="utf-8"))
+            self.assertEqual(on_disk["s1"], "My Custom Name")
+
+            # Verify round-trip load
+            loaded = self.mod["_load_session_names"]()
+            self.assertEqual(loaded["s1"], "My Custom Name")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_rename_session_strips_auto_prefix(self):
+        tmpdir = Path(__file__).resolve().parent / f"tmp-names-{uuid.uuid4().hex}"
+        tmpdir.mkdir()
+        names_file = tmpdir / "session-names.json"
+        self.globals["SESSION_NAMES_FILE"] = names_file
+        auto_prefix = self.globals["AUTO_PREFIX"]
+
+        try:
+            sid = f"{auto_prefix}abc-123-def"
+            upsert = self.mod["upsert_session"]
+            upsert({"session_id": sid, "name": "auto-name", "task": "t1"})
+
+            result, code = self.mod["rename_session"](sid, "Renamed Session")
+            self.assertEqual(code, 200)
+
+            # Key on disk should be the raw UUID, not the auto~ prefixed one
+            on_disk = json.loads(names_file.read_text(encoding="utf-8"))
+            self.assertIn("abc-123-def", on_disk)
+            self.assertNotIn(sid, on_disk)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_rename_rejects_empty_name(self):
+        result, code = self.mod["rename_session"]("s1", "")
+        self.assertEqual(code, 400)
+
+        result, code = self.mod["rename_session"]("s1", "   ")
+        self.assertEqual(code, 400)
+
+    def test_scan_applies_name_override(self):
+        tmpdir = Path(__file__).resolve().parent / f"tmp-transcript-{uuid.uuid4().hex}"
+        project_dir = tmpdir / "C--Users-gmcmillan-Desktop-Project"
+        project_dir.mkdir(parents=True)
+        session_uuid = str(uuid.uuid4())
+        jsonl = project_dir / f"{session_uuid}.jsonl"
+        jsonl.write_text("data\n", encoding="utf-8")
+
+        try:
+            self.globals["CLAUDE_PROJECTS_DIR"] = tmpdir
+            self.globals["SYSTEM_BOOT_TIME"] = 0
+            self.globals["ACTIVE_THRESHOLD_SEC"] = 999999
+            self.globals["IDLE_THRESHOLD_SEC"] = 999999
+            self.globals["_count_claude_processes"] = lambda: 1
+            self.globals["_scan_wt_tabs"] = lambda: []
+            self.globals["_get_transcript_summary"] = lambda path: {
+                "first_user_message": "auto-derived-name",
+                "last_user_message": "some task",
+                "slug": "",
+                "usage": {},
+            }
+
+            # Set a name override for this session UUID
+            self.globals["session_name_overrides"][session_uuid] = "My Renamed Chat"
+
+            self.mod["scan_claude_sessions"]()
+
+            auto_prefix = self.globals["AUTO_PREFIX"]
+            sid = f"{auto_prefix}{session_uuid}"
+            self.assertIn(sid, self.globals["sessions"])
+            self.assertEqual(
+                self.globals["sessions"][sid].name, "My Renamed Chat"
+            )
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

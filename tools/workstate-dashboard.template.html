@@ -125,6 +125,25 @@
     align-items: center;
     gap: 8px;
   }
+  .session-name {
+    cursor: pointer;
+  }
+  .session-name:hover {
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    text-underline-offset: 3px;
+  }
+  .rename-input {
+    background: #161b22;
+    color: #e6edf3;
+    border: 1px solid #3fb950;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-family: inherit;
+    font-size: inherit;
+    outline: none;
+    width: 220px;
+  }
   .dot {
     width: 8px;
     height: 8px;
@@ -628,7 +647,7 @@ function renderTable(data) {
         <td>
           <div class="name-cell tooltip">
             <span class="dot ${dotClass(s.staleness)}"></span>
-            <span class="session-name">${escapeHtml(s.name)}</span>
+            <span class="session-name" data-sid="${escapeHtml(s.session_id)}" onclick="startRename(this)">${escapeHtml(s.name)}</span>
             <span class="tooltip-text">${historyTip}</span>
           </div>
         </td>
@@ -673,6 +692,44 @@ function renderTable(data) {
   } else {
     expiredEl.innerHTML = '';
   }
+}
+
+function startRename(span) {
+  const sid = span.dataset.sid;
+  const oldName = span.textContent;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'rename-input';
+  input.value = oldName;
+
+  function commit() {
+    const newName = input.value.trim();
+    if (newName && newName !== oldName) {
+      fetch(`/api/session/${encodeURIComponent(sid)}/name`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: newName}),
+      }).then(() => refresh());
+    }
+    cancel();
+  }
+
+  function cancel() {
+    if (input.parentNode) {
+      input.replaceWith(span);
+      span.textContent = input.value.trim() || oldName;
+    }
+  }
+
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+  input.addEventListener('blur', commit);
+
+  span.replaceWith(input);
+  input.focus();
+  input.select();
 }
 
 async function refresh() {

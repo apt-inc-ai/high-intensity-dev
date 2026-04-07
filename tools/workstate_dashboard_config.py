@@ -16,7 +16,7 @@ DEFAULT_SERVICE_GROUPS = [
         "services": [
             {
                 "id": "frontend",
-                "name": "Frontend",
+                "name": "GUS R1 Frontend",
                 "display_url": "localhost:3000",
                 "probe_url": "http://localhost:3000/",
                 "link_url": "http://localhost:3000/",
@@ -24,10 +24,26 @@ DEFAULT_SERVICE_GROUPS = [
             },
             {
                 "id": "backend",
-                "name": "Backend API",
+                "name": "GUS R1 Backend",
                 "display_url": "localhost:8001/health",
                 "probe_url": "http://localhost:8001/health",
                 "link_url": "http://localhost:8001/health",
+                "kind": "http",
+            },
+            {
+                "id": "ampi-frontend",
+                "name": "AMPI Frontend",
+                "display_url": "localhost:3001",
+                "probe_url": "http://localhost:3001/",
+                "link_url": "http://localhost:3001/",
+                "kind": "http",
+            },
+            {
+                "id": "ampi-backend",
+                "name": "AMPI Backend",
+                "display_url": "localhost:8002/health",
+                "probe_url": "http://localhost:8002/health",
+                "link_url": "http://localhost:8002/health",
                 "kind": "http",
             },
         ],
@@ -37,7 +53,7 @@ DEFAULT_SERVICE_GROUPS = [
         "services": [
             {
                 "id": "web-frontend",
-                "name": "Web Frontend",
+                "name": "GUS R1 Frontend",
                 "display_url": "app.apt-gus.ai",
                 "probe_url": "https://app.apt-gus.ai/api/health",
                 "link_url": "https://app.apt-gus.ai/",
@@ -45,10 +61,26 @@ DEFAULT_SERVICE_GROUPS = [
             },
             {
                 "id": "web-backend",
-                "name": "Web Backend",
+                "name": "GUS R1 Backend",
                 "display_url": "api.apt-gus.ai/health",
                 "probe_url": "https://api.apt-gus.ai/health",
                 "link_url": "https://api.apt-gus.ai/health",
+                "kind": "http",
+            },
+            {
+                "id": "ampi-web-frontend",
+                "name": "AMPI Frontend",
+                "display_url": "ampi.apt-gus.ai",
+                "probe_url": "https://ampi.apt-gus.ai/api/health",
+                "link_url": "https://ampi.apt-gus.ai/",
+                "kind": "http",
+            },
+            {
+                "id": "ampi-web-backend",
+                "name": "AMPI Backend",
+                "display_url": "ampi-api.apt-gus.ai/health",
+                "probe_url": "https://ampi-api.apt-gus.ai/health",
+                "link_url": "https://ampi-api.apt-gus.ai/health",
                 "kind": "http",
             },
         ],
@@ -86,13 +118,23 @@ DEFAULT_SERVICE_GROUPS = [
 
 DEFAULT_PAGE_GROUPS = [
     {
-        "title": "Local Pages",
+        "title": "GUS R1 Local Pages",
         "links": [
             {"label": "Chat", "url": "http://localhost:3000/", "route": "/"},
             {
                 "label": "Digital Twin",
                 "url": "http://localhost:3000/digital-twin",
                 "route": "/digital-twin",
+            },
+            {
+                "label": "Make Room",
+                "url": "http://localhost:3000/make-room",
+                "route": "/make-room",
+            },
+            {
+                "label": "Dependency Graph",
+                "url": "http://localhost:3000/dependency-graph",
+                "route": "/dependency-graph",
             },
             {
                 "label": "Code Graph",
@@ -115,13 +157,34 @@ DEFAULT_PAGE_GROUPS = [
         ],
     },
     {
-        "title": "Web Pages",
+        "title": "AMPI Local Pages",
+        "links": [
+            {"label": "Chat", "url": "http://localhost:3001/", "route": "/"},
+            {
+                "label": "Make Room",
+                "url": "http://localhost:3001/make-room",
+                "route": "/make-room",
+            },
+        ],
+    },
+    {
+        "title": "GUS R1 Web Pages",
         "links": [
             {"label": "Chat", "url": "https://app.apt-gus.ai/", "route": "app.apt-gus.ai"},
             {
                 "label": "Digital Twin",
                 "url": "https://app.apt-gus.ai/digital-twin",
                 "route": "/digital-twin",
+            },
+            {
+                "label": "Make Room",
+                "url": "https://app.apt-gus.ai/make-room",
+                "route": "/make-room",
+            },
+            {
+                "label": "Dependency Graph",
+                "url": "https://app.apt-gus.ai/dependency-graph",
+                "route": "/dependency-graph",
             },
             {
                 "label": "Code Graph",
@@ -142,6 +205,17 @@ DEFAULT_PAGE_GROUPS = [
             {"label": "Report Issue", "url": "https://app.apt-gus.ai/feedback", "route": "/feedback"},
             {"label": "Docs", "url": "https://gus-docs.pages.dev/", "route": "gus-docs.pages.dev"},
             {"label": "Landing Page", "url": "https://apt-gus.ai/", "route": "apt-gus.ai"},
+        ],
+    },
+    {
+        "title": "AMPI Web Pages",
+        "links": [
+            {"label": "Chat", "url": "https://ampi.apt-gus.ai/", "route": "ampi.apt-gus.ai"},
+            {
+                "label": "Make Room",
+                "url": "https://ampi.apt-gus.ai/make-room",
+                "route": "/make-room",
+            },
         ],
     },
 ]

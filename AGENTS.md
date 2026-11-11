@@ -33,6 +33,9 @@ Zero dependencies — stdlib only. Everything else in the repo is Markdown to re
 
 ## Git Rules
 
+Workflow validation must check base-branch change events and explicit token
+permissions; YAML parsing and compilation alone missed both in PR #3.
+
 Inherited from [global CLAUDE.md](~/.claude/CLAUDE.md). Never commit/push without explicit ask.
 
 **Repo-specific:** this is a public repo with external contributors — see `CONTRIBUTING.md` for the pattern-submission workflow before committing new material.

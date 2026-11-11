@@ -21,7 +21,7 @@ name: CodeRabbit review integrity
 #   has a different name; only the API check is required.
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
   merge_group:
   status:
   check_run:

@@ -1,0 +1,25 @@
+# Generated from apt-inc-ai/repo-standards templates/dependabot; edit freely, the drift check only
+# requires that the file exists.
+version: 2
+updates:
+- package-ecosystem: github-actions
+  ignore:
+  - dependency-name: apt-inc-ai/repo-standards*
+  schedule:
+    interval: weekly
+    day: monday
+    time: "06:00"
+    timezone: America/Chicago
+  open-pull-requests-limit: 5
+  cooldown:
+    default-days: 3
+  labels:
+  - dependencies
+  - ci
+  groups:
+    actions-minor-and-patch:
+      update-types:
+      - minor
+      - patch
+  directories:
+  - /

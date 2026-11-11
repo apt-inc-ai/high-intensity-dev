@@ -1,0 +1,24 @@
+name: CodeRabbit review integrity refire
+
+# Unprivileged review-event relay. Its workflow_run completion wakes the
+# trusted default-branch evaluator, including on fork reviews. No artifacts,
+# review bodies or event conclusions authorize a passing check.
+permissions: {}
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+jobs:
+  refire:
+    name: Notify trusted review evaluator
+    if: github.event.review.user.login == 'coderabbitai[bot]' || github.event.review.user.login == 'coderabbitai'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - uses: apt-inc-ai/repo-standards/actions/coderabbit-refire@v1
+        with:
+          mode: wakeup
+          head-sha: ${{ github.event.pull_request.head.sha }}
+          github-token: ${{ github.token }}

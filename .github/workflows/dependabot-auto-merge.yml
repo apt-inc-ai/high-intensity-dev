@@ -1,0 +1,35 @@
+name: Dependabot auto-merge
+
+# Caller for the shared Dependabot auto-merge in apt-inc-ai/repo-standards.
+# Copy this file to .github/workflows/dependabot-auto-merge.yml. It calls the
+# moving major tag `v1`; the bootstrap pins it to a release commit for production
+# repos and sets the branch below to the repo's default branch (STANDARD.md,
+# Dependabot).
+#
+# Needs the Actions secret DEPENDABOT_MERGE_TOKEN (a pool bot's token) and, in
+# the repo, "Allow auto-merge" plus required checks on the default branch.
+# Dependabot PRs cannot read Actions secrets, so this runs on pull_request_target:
+# the workflow and the reusable workflow come from the default branch, never from
+# the pull request. The called workflow checks out nothing and never runs the PR
+# head. Do not add a checkout or a `ref:` here.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  dependabot:
+    # Same guard as the called workflow: a Dependabot PR from this repo, not a draft.
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: apt-inc-ai/repo-standards/.github/workflows/dependabot-auto-merge.yml@v1
+    secrets:
+      merge-token: ${{ secrets.DEPENDABOT_MERGE_TOKEN }}

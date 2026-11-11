@@ -1,0 +1,59 @@
+name: CodeRabbit review integrity
+
+# Merge gate: on the repository's high-caution paths a CodeRabbit review of the
+# code being merged must exist (policy: .github/repo-standards.yml at the PR's
+# base commit; no policy means every path). Logic lives in
+# apt-inc-ai/repo-standards/actions/coderabbit-gate; see actions/README.md there.
+#
+# Security properties, all load-bearing:
+# * `pull_request_target`, never `pull_request`: the gate runs from the BASE
+#   side, so a PR cannot edit the gate to pass itself.
+# * No checkout of the PR and nothing from the PR is executed. Everything about
+#   the PR is read through the API. Do not add a checkout with a `ref:` here.
+# * The action is called by the moving major tag `@v1`, so a gate fix released in
+#   repo-standards reaches every repo without a per-repo PR (STANDARD.md, Versioning).
+#   Do not repoint it at a branch or a fork.
+# * One serialized writer reconciles all open PRs on admitted PR/review events.
+#   Replaced queued events therefore cannot lose a different PR wakeup.
+# * merge_group explicitly passes its API check after PR review gates; it
+#   never runs or reviews the synthetic merge tree.
+# * The API check name stays "CodeRabbit review integrity". The transport job
+#   has a different name; only the API check is required.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+  status:
+  check_run:
+    types: [completed]
+  workflow_run:
+    workflows: [CodeRabbit review integrity refire]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  review-integrity:
+    name: Evaluate CodeRabbit review coverage
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'status' && (github.event.sender.login == 'coderabbitai[bot]' || github.event.sender.login == 'coderabbitai')) ||
+      (github.event_name == 'check_run' && github.event.check_run.app.slug == 'coderabbitai') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request_review' && github.event.workflow_run.path == '.github/workflows/coderabbit-review-refire.yml')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      # Queue SHAs need their own lock: their events cannot be recovered by
+      # reconciling open PR heads after a queued event is replaced.
+      group: ${{ github.event_name == 'merge_group' && format('coderabbit-integrity-merge-{0}', github.event.merge_group.head_sha) || 'coderabbit-integrity-reconcile' }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    steps:
+      - uses: apt-inc-ai/repo-standards/actions/coderabbit-gate@v1
+        with:
+          report-mode: check-run
+          github-token: ${{ github.token }}

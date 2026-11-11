@@ -1,0 +1,44 @@
+name: security
+
+# Caller for the shared security baseline in apt-inc-ai/repo-standards.
+# Copy this file to .github/workflows/security.yml unchanged. It calls the
+# moving major tag `v1`, so a fix released in repo-standards reaches every repo
+# without a per-repo PR (STANDARD.md, Versioning). Branch protection requires
+# `security / secrets`, `security / sast` and `security / deps` for the engine
+# and code tiers, `security / secrets` for the content tier.
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main, master]
+  schedule:
+    # Weekly, Monday 07:xx UTC. The bootstrap picks the minute (0-59) per repo
+    # so the fleet does not start every heavy scan at the same instant.
+    - cron: '37 7 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  security:
+    # A called workflow can only narrow these, never widen them. The scorecard
+    # job needs the extra read scopes; nothing here grants write.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+      issues: read
+      checks: read
+      statuses: read
+    uses: apt-inc-ai/repo-standards/.github/workflows/security.yml@v1
+    with:
+      # full-history: false
+      # dockerfile: Dockerfile
+      # fail-on: none          # none | high | critical (secrets always block)
+      # semgrep-config: p/python p/javascript p/security-audit
+      full-history: false

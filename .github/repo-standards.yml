@@ -1,0 +1,11 @@
+# What this repo customizes; everything else follows
+# https://github.com/apt-inc-ai/repo-standards/blob/main/STANDARD.md
+version: 1
+tier: code
+customer: false
+production: false
+review:
+  high_caution: all
+checks:
+- tests
+exceptions: []
